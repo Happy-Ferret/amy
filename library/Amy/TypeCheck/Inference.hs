@@ -459,56 +459,51 @@ unifies (T.TyApp f1 arg1) (T.TyApp f2 arg2) = do
   pure (su2 `composeSubst` su1)
 unifies (T.TyCon name1) (T.TyCon name2)
   | name1 == name2 = return emptySubst
-unifies t1@(T.TyRecord rows1 mVar1) t2@(T.TyRecord rows2 mVar2) = do
-  let
-    commonFields = Map.intersectionWith (,) rows1 rows2
-    justFields1 = Map.difference rows1 rows2
-    justFields2 = Map.difference rows2 rows1
-    unifyRecordWithVar subst rows mVar unifyVar = do
-      subst' <-
-        case (Map.null rows, mVar, unifyVar) of
-          -- TODO: This special case for user-generated type variables seems
-          -- super janky. Is there something more principled here? The reason
-          -- for this is to allow user-defined extensible records in type
-          -- signatures. Normal unification would only allow generated type
-          -- variables to unify with the empty record otherwise. We can only do
-          -- this for empty records because if we didn't then we would be too
-          -- permissive.
-          (True, Just var, T.TyVarInfo _ TyVarNotGenerated) -> pure $ singletonSubst var (T.TyVar unifyVar)
-          _ -> unifies (substituteType subst $ T.TyRecord rows mVar) (substituteType subst $ T.TyVar unifyVar)
-      pure $ subst' `composeSubst` subst
+unifies t1@(T.TyRecord rows1 mVar1) t2@(T.TyRecord rows2 mVar2) =
+  case (Map.toList rows1, Map.null rows2) of
+    ([], True) ->
+      case (mVar1, mVar2) of
+        (Just var1, _) -> unifies (T.TyVar var1) t2
+        (Nothing, Just var2) -> unifies t1 (T.TyVar var2)
+        (_, _) ->
+          if Map.null rows2
+          then pure emptySubst
+          else throwError $ UnificationFail t1 t2
+    --([], True) -> pure emptySubst
+    ([], False) -> unifies t2 t1
+    ((l, ty):rest, _) -> do
+      -- Rewrite the second row
+      (subst1, ty', tail2) <-
+        case (Map.lookup l rows2, mVar2) of
+          -- Couldn't find row, and no tail to unify with
+          (Nothing, Nothing) -> throwError $ UnificationFail t1 t2
+          (Nothing, Just var2) ->
+            -- Side condition: if the tails of both rows are the same, then
+            -- don't unify. This prevents us from unifying rows with the same
+            -- tail but not the same prefix. For example, {x::Int|a} and
+            -- {y::Int|a} shouldn't unify.
+            if mVar1 == Just var2
+            then throwError $ UnificationFail t1 t2
+            else do
+              beta <- freshTypeVariable
+              gamma <- freshTypeVariable
+              let subst = singletonSubst var2 $ T.TyRecord (Map.singleton l (T.TyVar gamma)) (Just beta)
+              pure (subst, T.TyVar gamma, T.TyVar beta)
+          -- The label is present, no rewrites needed.
+          (Just ty2, _) -> pure (emptySubst, ty2, T.TyRecord (Map.delete l rows2) mVar2)
 
-  substCommon <- uncurry unifyMany $ unzip $ snd <$> Map.toAscList commonFields
-  case (mVar1, mVar2) of
-    -- Neither record is extensible
-    (Nothing, Nothing) ->
-      if Map.keysSet rows1 == Map.keysSet rows2
-      then pure substCommon
-      else throwError $ UnificationFail t1 t2
-    -- Both records are extensible
-    (Just var1, Just var2) -> do
-      fresh1 <- freshTypeVariable
-      subst' <- unifyRecordWithVar substCommon justFields1 (Just fresh1) var2
-      fresh2 <- freshTypeVariable
-      unifyRecordWithVar subst' justFields2 (Just fresh2) var1
-    -- Only one record is extensible
-    (Just var1, Nothing) ->
-      if null justFields1
-      then unifyRecordWithVar substCommon justFields2 Nothing var1
-      else throwError $ UnificationFail t1 t2
-    (Nothing, Just var2) ->
-      if null justFields2
-      then unifyRecordWithVar substCommon justFields1 Nothing var2
-      else throwError $ UnificationFail t1 t2
+      -- Unify the value types for this row
+      subst2 <- unifies (substituteType subst1 ty) (substituteType subst1 ty')
+
+      -- Unify the tails
+      let
+        subst2' = subst2 `composeSubst` subst1
+        tail1 = T.TyRecord (Map.fromList rest) mVar1
+      susbt3 <- unifies (substituteType subst2' tail1) (substituteType subst2' tail2)
+
+      -- Combine all substitutions
+      pure $ susbt3 `composeSubst` subst2'
 unifies t1 t2 = throwError $ UnificationFail t1 t2
-
-unifyMany :: [T.Type] -> [T.Type] -> Inference Subst
-unifyMany [] [] = return emptySubst
-unifyMany (t1 : ts1) (t2 : ts2) = do
-  su1 <- unifies t1 t2
-  su2 <- unifyMany (substituteType su1 <$> ts1) (substituteType su1 <$> ts2)
-  return (su2 `composeSubst` su1)
-unifyMany t1 t2 = error $ "unifyMany lists different length " ++ show (t1, t2)
 
 bind ::  T.TyVarInfo -> T.Type -> Inference Subst
 bind a t
